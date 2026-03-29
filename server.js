@@ -209,8 +209,12 @@ fastify.post("/call", async (request, reply) => {
   });
   const safeParams = params.toString().replace(/&/g, "&amp;");
 
+  // Greeting is spoken instantly by Twilio's TTS (zero latency)
+  // Then seamlessly hands off to Hume EVI stream for live conversation
+  const firstName = (contactName || "there").split(" ")[0];
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
+  <Say voice="Polly.Matthew-Neural">Hey ${firstName}, this is Adam from Antimatter AI. Hope I'm not catching you at a bad time?</Say>
   <Connect>
     <Stream url="wss://${cleanDomain}/media-stream?${safeParams}" />
   </Connect>
@@ -324,6 +328,7 @@ fastify.register(async function (fastify) {
     let humeReady = false;
     let markCounter = 0;
     let isBotSpeaking = false;
+    let suppressGreetingAudio = true; // Skip first audio_output (greeting already spoken by Twilio TTS)
 
     // ── Connect to Hume EVI ───────────────────────────────────
     const humeUrl = `wss://api.hume.ai/v0/evi/chat?api_key=${HUME_API_KEY}&config_id=${HUME_CONFIG_ID}`;
@@ -354,12 +359,13 @@ fastify.register(async function (fastify) {
         },
       }));
 
-      // Pre-load greeting via assistant_input — Hume will TTS this immediately
-      // No round-trip delay since we're not waiting for model generation
+      // Greeting was already spoken by Twilio TTS (instant, zero latency).
+      // Tell Hume what was said so it has context, then it just listens.
       humeWs.send(JSON.stringify({
         type: "assistant_input",
         text: `Hey ${firstName}, this is Adam from Antimatter AI. Hope I'm not catching you at a bad time?`,
       }));
+      console.log(`[timing] Hume ready, greeting already delivered by Twilio TTS`);
     });
 
     humeWs.on("error", (err) => console.error("Hume WS error:", err.message));
@@ -389,6 +395,9 @@ fastify.register(async function (fastify) {
         const msg = JSON.parse(data.toString());
 
         if (msg.type === "audio_output" && msg.data && streamSid) {
+          // Suppress all audio from the greeting — Twilio TTS already spoke it
+          if (suppressGreetingAudio) return;
+
           isBotSpeaking = true;
           try {
             const mulawChunks = wavToMulawChunks(msg.data);
@@ -411,6 +420,10 @@ fastify.register(async function (fastify) {
         }
 
         if (msg.type === "assistant_end") {
+          if (suppressGreetingAudio) {
+            suppressGreetingAudio = false;
+            console.log("[timing] Greeting audio suppressed, Hume now in listen mode");
+          }
           isBotSpeaking = false;
         }
 
