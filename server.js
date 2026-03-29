@@ -41,6 +41,8 @@ await fastify.register(fastifyCors, { origin: true });
 
 // ─── Active Calls Registry (for real-time streaming to frontend) ──
 const activeCalls = new Map();
+// Pre-warmed Hume connections keyed by callSid
+const prewarmedHume = new Map();
 
 // ─── Product Knowledge Base ──────────────────────────────────────
 const PRODUCT_KNOWLEDGE = {
@@ -209,12 +211,8 @@ fastify.post("/call", async (request, reply) => {
   });
   const safeParams = params.toString().replace(/&/g, "&amp;");
 
-  // Greeting is spoken instantly by Twilio's TTS (zero latency)
-  // Then seamlessly hands off to Hume EVI stream for live conversation
-  const firstName = (contactName || "there").split(" ")[0];
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Matthew-Neural">Hey ${firstName}, this is Adam from Antimatter AI. Hope I'm not catching you at a bad time?</Say>
   <Connect>
     <Stream url="wss://${cleanDomain}/media-stream?${safeParams}" />
   </Connect>
@@ -242,6 +240,13 @@ fastify.post("/call", async (request, reply) => {
     });
 
     console.log(`Call initiated: ${call.sid} → ${cleanNumber}`);
+
+    // Pre-warm Hume connection while the phone is ringing
+    // By the time prospect picks up, Hume is already connected and greeting is queued
+    const product = PRODUCT_KNOWLEDGE[productSlug] || PRODUCT_KNOWLEDGE["antimatter-ai"];
+    const firstName = (contactName || "there").split(" ")[0];
+    prewarmHume(call.sid, firstName, contactName || "there", companyName || "your company", productSlug || "antimatter-ai", product);
+
     return { success: true, callSid: call.sid, to: cleanNumber };
   } catch (err) {
     console.error("Call error:", err.message);
@@ -310,17 +315,77 @@ fastify.get("/call/:callSid/summary", async (request, reply) => {
   };
 });
 
+// ─── Pre-warm Hume Connection ───────────────────────────────────
+function prewarmHume(callSid, firstName, contactName, companyName, productSlug, product) {
+  const humeUrl = `wss://api.hume.ai/v0/evi/chat?api_key=${HUME_API_KEY}&config_id=${HUME_CONFIG_ID}`;
+  const startTime = Date.now();
+
+  try {
+    const humeWs = new WebSocket(humeUrl);
+    const state = {
+      humeWs,
+      ready: false,
+      greetingAudioChunks: [],
+      greetingDone: false,
+    };
+
+    humeWs.on("open", () => {
+      console.log(`[prewarm] Hume connected for ${callSid} (${Date.now() - startTime}ms)`);
+      state.ready = true;
+
+      // Configure audio + deep context
+      humeWs.send(JSON.stringify({
+        type: "session_settings",
+        audio: { encoding: "linear16", sample_rate: TWILIO_SAMPLE_RATE, channels: 1 },
+        context: { text: buildSystemPrompt(firstName, companyName, product), type: "persistent" },
+      }));
+
+      // Queue the greeting — Hume will TTS it and we buffer the audio
+      humeWs.send(JSON.stringify({
+        type: "assistant_input",
+        text: `Hey ${firstName}, this is Adam from Antimatter AI. Hope I'm not catching you at a bad time?`,
+      }));
+    });
+
+    // Buffer greeting audio while phone rings
+    humeWs.on("message", (data) => {
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.type === "audio_output" && msg.data && !state.greetingDone) {
+          state.greetingAudioChunks.push(msg.data);
+        }
+        if (msg.type === "assistant_end" && !state.greetingDone) {
+          state.greetingDone = true;
+          console.log(`[prewarm] Greeting buffered: ${state.greetingAudioChunks.length} WAV chunks (${Date.now() - startTime}ms)`);
+        }
+        if (msg.type === "error") {
+          console.error("[prewarm] Hume error:", msg.message || JSON.stringify(msg));
+        }
+      } catch (e) {}
+    });
+
+    humeWs.on("error", (err) => console.error(`[prewarm] Hume WS error: ${err.message}`));
+
+    prewarmedHume.set(callSid, state);
+
+    // Cleanup if phone never picked up (30s timeout)
+    setTimeout(() => {
+      if (prewarmedHume.has(callSid)) {
+        const s = prewarmedHume.get(callSid);
+        if (s.humeWs.readyState === WebSocket.OPEN) s.humeWs.close();
+        prewarmedHume.delete(callSid);
+        console.log(`[prewarm] Timeout cleanup for ${callSid}`);
+      }
+    }, 30000);
+  } catch (err) {
+    console.error("[prewarm] Failed:", err.message);
+  }
+}
+
 // ─── Twilio ↔ Hume Bridge ───────────────────────────────────────
 fastify.register(async function (fastify) {
   fastify.get("/media-stream", { websocket: true }, async (socket, req) => {
     console.log("=== Twilio Media Stream connected ===");
-
-    const url = new URL(req.url, `http://${req.headers.host}`);
-    const contactName = url.searchParams.get("contactName") || "there";
-    const companyName = url.searchParams.get("companyName") || "your company";
-    const productSlug = url.searchParams.get("productSlug") || "antimatter-ai";
-    const product = PRODUCT_KNOWLEDGE[productSlug] || PRODUCT_KNOWLEDGE["antimatter-ai"];
-    const firstName = contactName.split(" ")[0];
 
     let streamSid = null;
     let callSid = null;
@@ -328,167 +393,100 @@ fastify.register(async function (fastify) {
     let humeReady = false;
     let markCounter = 0;
     let isBotSpeaking = false;
-    let suppressGreetingAudio = true; // Skip first audio_output (greeting already spoken by Twilio TTS)
 
-    // ── Connect to Hume EVI ───────────────────────────────────
-    const humeUrl = `wss://api.hume.ai/v0/evi/chat?api_key=${HUME_API_KEY}&config_id=${HUME_CONFIG_ID}`;
+    // Wire up Hume → Twilio message handler
+    function attachHumeListeners(ws) {
+      ws.removeAllListeners("message");
+      ws.removeAllListeners("close");
 
-    try {
-      humeWs = new WebSocket(humeUrl);
-    } catch (err) {
-      console.error("Failed to create Hume WebSocket:", err.message);
-      socket.close();
-      return;
-    }
+      ws.on("message", (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
 
-    humeWs.on("open", () => {
-      console.log("Connected to Hume EVI");
-      humeReady = true;
-
-      // Configure audio format + deep system context
-      humeWs.send(JSON.stringify({
-        type: "session_settings",
-        audio: {
-          encoding: "linear16",
-          sample_rate: TWILIO_SAMPLE_RATE,
-          channels: 1,
-        },
-        context: {
-          text: buildSystemPrompt(firstName, companyName, product),
-          type: "persistent",
-        },
-      }));
-
-      // Greeting was already spoken by Twilio TTS (instant, zero latency).
-      // Tell Hume what was said so it has context, then it just listens.
-      humeWs.send(JSON.stringify({
-        type: "assistant_input",
-        text: `Hey ${firstName}, this is Adam from Antimatter AI. Hope I'm not catching you at a bad time?`,
-      }));
-      console.log(`[timing] Hume ready, greeting already delivered by Twilio TTS`);
-    });
-
-    humeWs.on("error", (err) => console.error("Hume WS error:", err.message));
-
-    humeWs.on("close", (code) => {
-      console.log(`Hume closed: ${code}`);
-      humeReady = false;
-
-      // Finalize call data
-      if (callSid && activeCalls.has(callSid)) {
-        const call = activeCalls.get(callSid);
-        call.endTime = Date.now();
-        emitEvent(callSid, {
-          type: "call_ended",
-          duration: Math.round((call.endTime - call.startTime) / 1000),
-          turnCount: call.transcript.length,
-        });
-
-        // Auto-cleanup after 10 minutes
-        setTimeout(() => activeCalls.delete(callSid), 600000);
-      }
-    });
-
-    // ── Hume → Twilio ─────────────────────────────────────────
-    humeWs.on("message", (data) => {
-      try {
-        const msg = JSON.parse(data.toString());
-
-        if (msg.type === "audio_output" && msg.data && streamSid) {
-          // Suppress all audio from the greeting — Twilio TTS already spoke it
-          if (suppressGreetingAudio) return;
-
-          isBotSpeaking = true;
-          try {
-            const mulawChunks = wavToMulawChunks(msg.data);
-            for (const chunk of mulawChunks) {
+          if (msg.type === "audio_output" && msg.data && streamSid) {
+            isBotSpeaking = true;
+            try {
+              const mulawChunks = wavToMulawChunks(msg.data);
+              for (const chunk of mulawChunks) {
+                socket.send(JSON.stringify({
+                  event: "media", streamSid, media: { payload: chunk },
+                }));
+              }
+              markCounter++;
               socket.send(JSON.stringify({
-                event: "media",
-                streamSid,
-                media: { payload: chunk },
+                event: "mark", streamSid, mark: { name: `mark_${markCounter}` },
               }));
+            } catch (e) {
+              console.error("Hume→Twilio transcode error:", e.message);
             }
-            markCounter++;
-            socket.send(JSON.stringify({
-              event: "mark",
-              streamSid,
-              mark: { name: `mark_${markCounter}` },
-            }));
-          } catch (e) {
-            console.error("Hume→Twilio transcode error:", e.message);
           }
-        }
 
-        if (msg.type === "assistant_end") {
-          if (suppressGreetingAudio) {
-            suppressGreetingAudio = false;
-            console.log("[timing] Greeting audio suppressed, Hume now in listen mode");
+          if (msg.type === "assistant_end") {
+            isBotSpeaking = false;
           }
-          isBotSpeaking = false;
-        }
 
-        if (msg.type === "assistant_message") {
-          const text = msg.message?.content || "";
-          console.log(`ATOM: ${text}`);
-          if (callSid) {
-            const entry = { speaker: "ATOM", text, timestamp: Date.now() };
-            const call = activeCalls.get(callSid);
-            if (call) call.transcript.push(entry);
-            emitEvent(callSid, { type: "transcript", ...entry });
+          if (msg.type === "assistant_message") {
+            const text = msg.message?.content || "";
+            console.log(`ATOM: ${text}`);
+            if (callSid) {
+              const entry = { speaker: "ATOM", text, timestamp: Date.now() };
+              const call = activeCalls.get(callSid);
+              if (call) call.transcript.push(entry);
+              emitEvent(callSid, { type: "transcript", ...entry });
+            }
           }
-        }
 
-        if (msg.type === "user_message") {
-          const text = msg.message?.content || "";
-          console.log(`Caller: ${text}`);
-
-          const emotions = msg.models?.prosody?.scores || {};
-          const topEmotions = Object.entries(emotions)
-            .sort(([, a], [, b]) => b - a)
-            .slice(0, 3)
-            .map(([n, s]) => `${n}:${(s * 100).toFixed(0)}%`);
-          if (topEmotions.length) console.log(`  Emotions: ${topEmotions.join(", ")}`);
-
-          if (callSid) {
-            const call = activeCalls.get(callSid);
-            if (call) {
-              call.transcript.push({
-                speaker: "Prospect",
-                text,
-                timestamp: Date.now(),
+          if (msg.type === "user_message") {
+            const text = msg.message?.content || "";
+            console.log(`Caller: ${text}`);
+            const emotions = msg.models?.prosody?.scores || {};
+            const topEm = Object.entries(emotions)
+              .sort(([, a], [, b]) => b - a).slice(0, 3)
+              .map(([n, s]) => `${n}:${(s * 100).toFixed(0)}%`);
+            if (topEm.length) console.log(`  Emotions: ${topEm.join(", ")}`);
+            if (callSid) {
+              const call = activeCalls.get(callSid);
+              if (call) {
+                call.transcript.push({ speaker: "Prospect", text, timestamp: Date.now() });
+                call.emotions.push({ scores: emotions, timestamp: Date.now() });
+              }
+              emitEvent(callSid, {
+                type: "transcript", speaker: "Prospect", text, timestamp: Date.now(),
+                emotions: Object.fromEntries(Object.entries(emotions).sort(([,a],[,b])=>b-a).slice(0,5)),
               });
-              call.emotions.push({ scores: emotions, timestamp: Date.now() });
             }
-            emitEvent(callSid, {
-              type: "transcript",
-              speaker: "Prospect",
-              text,
-              timestamp: Date.now(),
-              emotions: Object.fromEntries(
-                Object.entries(emotions)
-                  .sort(([, a], [, b]) => b - a)
-                  .slice(0, 5)
-              ),
-            });
           }
-        }
 
-        if (msg.type === "user_interruption") {
-          console.log(">>> Barge-in — clearing buffer");
-          if (streamSid) {
-            socket.send(JSON.stringify({ event: "clear", streamSid }));
+          if (msg.type === "user_interruption") {
+            console.log(">>> Barge-in — clearing buffer");
+            if (streamSid) socket.send(JSON.stringify({ event: "clear", streamSid }));
+            isBotSpeaking = false;
+            if (callSid) emitEvent(callSid, { type: "barge_in", timestamp: Date.now() });
           }
-          isBotSpeaking = false;
-          if (callSid) emitEvent(callSid, { type: "barge_in", timestamp: Date.now() });
-        }
 
-        if (msg.type === "error") {
-          console.error("Hume error:", msg.message || JSON.stringify(msg));
+          if (msg.type === "error") {
+            console.error("Hume error:", msg.message || JSON.stringify(msg));
+          }
+        } catch (err) {
+          console.error("Error processing Hume message:", err.message);
         }
-      } catch (err) {
-        console.error("Error processing Hume message:", err.message);
-      }
-    });
+      });
+
+      ws.on("close", (code) => {
+        console.log(`Hume closed: ${code}`);
+        humeReady = false;
+        if (callSid && activeCalls.has(callSid)) {
+          const call = activeCalls.get(callSid);
+          call.endTime = Date.now();
+          emitEvent(callSid, {
+            type: "call_ended",
+            duration: Math.round((call.endTime - call.startTime) / 1000),
+            turnCount: call.transcript.length,
+          });
+          setTimeout(() => activeCalls.delete(callSid), 600000);
+        }
+      });
+    }
 
     // ── Twilio → Hume ─────────────────────────────────────────
     socket.on("message", (message) => {
@@ -500,8 +498,68 @@ fastify.register(async function (fastify) {
             streamSid = data.start.streamSid;
             callSid = data.start.callSid;
             console.log(`Stream started: ${streamSid} (Call: ${callSid})`);
-            if (callSid) {
-              emitEvent(callSid, { type: "call_started", timestamp: Date.now() });
+            if (callSid) emitEvent(callSid, { type: "call_started", timestamp: Date.now() });
+
+            // Grab pre-warmed Hume connection (connected while phone was ringing)
+            const prewarmed = prewarmedHume.get(callSid);
+            if (prewarmed && prewarmed.humeWs.readyState === WebSocket.OPEN) {
+              humeWs = prewarmed.humeWs;
+              humeReady = prewarmed.ready;
+              prewarmedHume.delete(callSid);
+
+              // Replace prewarm listeners with live bridge listeners
+              attachHumeListeners(humeWs);
+
+              // Flush buffered greeting audio immediately
+              if (prewarmed.greetingAudioChunks.length > 0) {
+                console.log(`[timing] Flushing ${prewarmed.greetingAudioChunks.length} pre-buffered greeting WAVs`);
+                for (const wavData of prewarmed.greetingAudioChunks) {
+                  try {
+                    const mulawChunks = wavToMulawChunks(wavData);
+                    for (const chunk of mulawChunks) {
+                      socket.send(JSON.stringify({
+                        event: "media", streamSid, media: { payload: chunk },
+                      }));
+                    }
+                  } catch (e) {
+                    console.error("Greeting flush error:", e.message);
+                  }
+                }
+                markCounter++;
+                socket.send(JSON.stringify({
+                  event: "mark", streamSid, mark: { name: `greeting_${markCounter}` },
+                }));
+                console.log(`[timing] Greeting flushed — ATOM speaking immediately`);
+              } else if (!prewarmed.greetingDone) {
+                // Greeting TTS still in progress — it'll arrive via the live listener
+                console.log(`[timing] Pre-warmed but greeting still generating — will stream live`);
+              }
+            } else {
+              // Fallback: no pre-warmed connection, connect fresh
+              console.log(`[timing] No pre-warmed Hume, connecting fresh (slower)`);
+              const urlObj = new URL(req.url, `http://${req.headers.host}`);
+              const contactName = urlObj.searchParams.get("contactName") || "there";
+              const companyName = urlObj.searchParams.get("companyName") || "your company";
+              const productSlug = urlObj.searchParams.get("productSlug") || "antimatter-ai";
+              const product = PRODUCT_KNOWLEDGE[productSlug] || PRODUCT_KNOWLEDGE["antimatter-ai"];
+              const firstName = contactName.split(" ")[0];
+
+              const humeUrl = `wss://api.hume.ai/v0/evi/chat?api_key=${HUME_API_KEY}&config_id=${HUME_CONFIG_ID}`;
+              humeWs = new WebSocket(humeUrl);
+              humeWs.on("open", () => {
+                humeReady = true;
+                humeWs.send(JSON.stringify({
+                  type: "session_settings",
+                  audio: { encoding: "linear16", sample_rate: TWILIO_SAMPLE_RATE, channels: 1 },
+                  context: { text: buildSystemPrompt(firstName, companyName, product), type: "persistent" },
+                }));
+                humeWs.send(JSON.stringify({
+                  type: "assistant_input",
+                  text: `Hey ${firstName}, this is Adam from Antimatter AI. Hope I'm not catching you at a bad time?`,
+                }));
+              });
+              humeWs.on("error", (err) => console.error("Hume WS error:", err.message));
+              attachHumeListeners(humeWs);
             }
             break;
 
@@ -510,9 +568,7 @@ fastify.register(async function (fastify) {
               try {
                 const pcm = mulawToLinear16(data.media.payload);
                 humeWs.send(JSON.stringify({ type: "audio_input", data: pcm }));
-              } catch (e) {
-                // Silently skip bad frames
-              }
+              } catch (e) {}
             }
             break;
 
@@ -535,6 +591,7 @@ fastify.register(async function (fastify) {
     });
   });
 });
+
 
 // ─── System Prompt Builder ───────────────────────────────────────
 function buildSystemPrompt(firstName, companyName, product) {
