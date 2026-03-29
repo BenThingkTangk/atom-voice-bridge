@@ -1,0 +1,20 @@
+{
+  "name": "atom-voice-bridge",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "ATOM Voice Bridge: Twilio ↔ Hume EVI real-time voice AI for outbound sales calls",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
+  },
+  "dependencies": {
+    "@fastify/formbody": "^8.0.2",
+    "@fastify/websocket": "^11.0.2",
+    "dotenv": "^16.4.7",
+    "fastify": "^5.3.2",
+    "hume": "^0.9.9",
+    "twilio": "^5.7.0",
+    "ws": "^8.18.0"
+  }
+}
