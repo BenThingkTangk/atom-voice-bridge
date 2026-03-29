@@ -190,7 +190,6 @@ fastify.register(async function (fastify) {
       humeReady = true;
 
       // Tell Hume we're sending linear16 PCM at 8kHz mono
-      // (we decode mulaw→linear16 but keep at 8kHz to avoid resampling issues)
       const firstName = contactName.split(" ")[0];
       humeWs.send(JSON.stringify({
         type: "session_settings",
@@ -200,21 +199,24 @@ fastify.register(async function (fastify) {
           channels: 1,
         },
         context: {
-          text: `You are ATOM, a real sales rep at Antimatter AI. You just called ${contactName} at ${companyName}. You are a real person — never reveal you're AI. Use short sentences, contractions, natural fillers. Be warm and conversational. Product: ${productSlug}. Greet them by first name.`,
+          text: `You are Adam, a real sales development rep at Antimatter AI. Your name is pronounced "Adam" — always say it that way, never spell it out. You just called ${firstName} at ${companyName}. Important rules: you are a real human, NEVER say you're AI or a bot. Use short sentences, 5 to 15 words. Always use contractions. Use natural fillers like "yeah", "so", "look", "honestly". Match the prospect's energy level. Be warm, conversational, and confident but never pushy. Product: ${productSlug}.`,
           type: "persistent",
         },
       }));
 
-      // Send user_input to trigger ATOM to speak first
-      // This is better than assistant_input as it lets the model generate naturally
+      // Trigger ATOM to speak first via assistant_input (no round-trip delay)
       setTimeout(() => {
         if (humeWs.readyState === WebSocket.OPEN) {
           humeWs.send(JSON.stringify({
-            type: "user_input",
-            text: `[The phone is ringing and ${firstName} just picked up. Greet them warmly and briefly — you're ATOM from Antimatter AI calling about ${productSlug}.]`,
+            type: "assistant_input",
+            text: `Hey ${firstName}, this is Adam from Antimatter AI. Hope I'm not catching you at a bad time?`,
+          }));
+          // Follow with assistant_end so Hume knows it's the bot's turn to listen
+          humeWs.send(JSON.stringify({
+            type: "assistant_end",
           }));
         }
-      }, 300);
+      }, 200);
     });
 
     humeWs.on("error", (err) => {
