@@ -1,6 +1,7 @@
 import Fastify from "fastify";
 import fastifyWs from "@fastify/websocket";
 import fastifyFormBody from "@fastify/formbody";
+import fastifyCors from "@fastify/cors";
 import WebSocket from "ws";
 import twilio from "twilio";
 import dotenv from "dotenv";
@@ -21,11 +22,8 @@ const {
 
 const PORT = process.env.PORT || 6060;
 const cleanDomain = (DOMAIN || "localhost").replace(/(^\w+:|^)\/\//, "").replace(/\/+$/, "");
-
-// Twilio media streams: mulaw 8kHz mono
 const TWILIO_SAMPLE_RATE = 8000;
-// Twilio sends/expects 20ms chunks = 160 bytes mulaw
-const TWILIO_CHUNK_BYTES = 160;
+const TWILIO_CHUNK_BYTES = 160; // 20ms at 8kHz mulaw
 
 if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY_SID || !TWILIO_API_KEY_SECRET || !HUME_API_KEY) {
   console.error("Missing required environment variables.");
@@ -39,88 +37,164 @@ const twilioClient = twilio(TWILIO_API_KEY_SID, TWILIO_API_KEY_SECRET, {
 const fastify = Fastify({ logger: true });
 await fastify.register(fastifyFormBody);
 await fastify.register(fastifyWs);
+await fastify.register(fastifyCors, { origin: true });
 
-// ─── Audio Transcoding Helpers ────────────────────────────────────
+// ─── Active Calls Registry (for real-time streaming to frontend) ──
+const activeCalls = new Map();
 
-/**
- * Convert Twilio mulaw 8kHz base64 → linear16 PCM base64
- * Keeps at 8kHz — Hume can handle 8kHz if we tell it via session_settings.
- * Avoids resampling artifacts.
- */
-function mulawToLinear16(base64Mulaw) {
-  const mulawBuf = Buffer.from(base64Mulaw, "base64");
-  // Decode mulaw to 16-bit linear PCM (same sample rate)
-  const pcmSamples = new Int16Array(mulawBuf.length);
-  for (let i = 0; i < mulawBuf.length; i++) {
-    pcmSamples[i] = mulawDecode(mulawBuf[i]);
-  }
-  return Buffer.from(pcmSamples.buffer).toString("base64");
+// ─── Product Knowledge Base ──────────────────────────────────────
+const PRODUCT_KNOWLEDGE = {
+  "antimatter-ai": {
+    name: "Antimatter AI",
+    pitch: "we build custom AI systems and digital products end to end",
+    details: "Over twenty successful projects. We handle design, engineering, AI, and go to market. No unhappy clients yet.",
+    qualifying: "What's your team working on right now? Any AI initiatives?",
+    objections: {
+      price: "We're flexible on pricing. For the right fit we do milestone based, so you only pay when we deliver.",
+      timing: "Totally get it. Even a fifteen minute intro call would help us understand if there's a fit. No pressure.",
+      competition: "What sets us apart is we own the full stack. You don't need three vendors. One team, one throat to choke.",
+      skepticism: "Fair enough. We could do a small proof of concept first. Low risk, you see the quality before committing.",
+    },
+  },
+  "atom-enterprise": {
+    name: "ATOM Enterprise AI",
+    pitch: "we help companies deploy AI agents in their own environment, whether that's on prem, VPC, or at the edge",
+    details: "You own your data and IP. No one trains on it. Swap model providers without rewriting code. Edge partnership with Akamai for low latency.",
+    qualifying: "How are you handling AI deployment and data governance right now?",
+    objections: {
+      price: "It's actually cheaper than running three separate SaaS tools. We consolidate your AI spend.",
+      timing: "We can get a pilot running in two weeks. Minimal lift from your team.",
+      competition: "Unlike the big cloud providers, we're model agnostic. You're never locked in.",
+      skepticism: "We can do a quick architecture review for free. You'll see exactly how it maps to your stack.",
+    },
+  },
+  "vidzee": {
+    name: "Vidzee",
+    pitch: "we turn listing photos into cinematic property videos in about five minutes",
+    details: "Agents save a couple hundred bucks per listing versus hiring a videographer. Over twelve thousand videos created. Works on Reels, TikTok, YouTube, MLS.",
+    qualifying: "Are you using video for your listings right now?",
+    objections: {
+      price: "It's a fraction of what a videographer charges and you get it in minutes, not days.",
+      timing: "You can try it right now. Upload a few photos and see the result in five minutes.",
+      competition: "We're the only ones doing AI cinematic video from still photos. Others just do slideshows.",
+      skepticism: "I'll send you a sample video from one of our top agents. Judge for yourself.",
+    },
+  },
+  "clinix-agent": {
+    name: "Clinix Agent",
+    pitch: "we help healthcare orgs recover revenue from denied claims by automating appeals and resubmissions",
+    details: "We stop denials before they happen with eligibility guardrails. Auto generate appeal packets tailored to each payer. Success based pricing, you only pay when we get the money back.",
+    qualifying: "What's your denial rate looking like these days?",
+    objections: {
+      price: "It's success based. You literally only pay when we recover money for you. Zero risk.",
+      timing: "We can plug in alongside your existing workflow. No rip and replace.",
+      competition: "Most tools just flag denials. We actually write and submit the appeals automatically.",
+      skepticism: "We can run a free analysis on your last ninety days of denials. You'll see the opportunity.",
+    },
+  },
+  "red-team-atom": {
+    name: "Red Team ATOM",
+    pitch: "we built the first quantum ready autonomous red team platform",
+    details: "Continuous adversarial simulations instead of annual pen tests. Post quantum crypto testing, MITRE ATLAS heat mapping, real time telemetry.",
+    qualifying: "How are you thinking about quantum readiness? The harvest now decrypt later threat is real.",
+    objections: {
+      price: "Compare it to the cost of one breach. We're a rounding error on your security budget.",
+      timing: "We can run a baseline assessment in a week. No integration needed for the first scan.",
+      competition: "Nobody else does continuous autonomous red teaming with quantum readiness built in.",
+      skepticism: "We'll run a free external scan and show you what we find. No commitment.",
+    },
+  },
+};
+
+// ─── Audio Transcoding ───────────────────────────────────────────
+
+// Mulaw decode table (ITU-T G.711) — precomputed for speed
+const MULAW_DECODE_TABLE = new Int16Array(256);
+for (let i = 0; i < 256; i++) {
+  let v = ~i & 0xFF;
+  const sign = v & 0x80;
+  const exponent = (v >> 4) & 0x07;
+  const mantissa = v & 0x0F;
+  let sample = ((mantissa << 3) + 0x84) << exponent;
+  sample -= 0x84;
+  MULAW_DECODE_TABLE[i] = sign ? -sample : sample;
 }
 
-/**
- * Convert Hume audio_output (base64 RIFF WAV) → array of mulaw 8kHz base64 chunks
- * Each chunk is ~20ms (160 bytes) for Twilio's expected packet size.
- */
+function mulawToLinear16(base64Mulaw) {
+  const mulaw = Buffer.from(base64Mulaw, "base64");
+  const pcm = Buffer.alloc(mulaw.length * 2);
+  for (let i = 0; i < mulaw.length; i++) {
+    const sample = MULAW_DECODE_TABLE[mulaw[i]];
+    pcm.writeInt16LE(sample, i * 2);
+  }
+  return pcm.toString("base64");
+}
+
 function wavToMulawChunks(base64Wav) {
   const wav = new WaveFile();
   wav.fromBuffer(Buffer.from(base64Wav, "base64"));
-
-  // Downsample to 8kHz if needed
-  if (wav.fmt.sampleRate !== TWILIO_SAMPLE_RATE) {
-    wav.toSampleRate(TWILIO_SAMPLE_RATE);
-  }
-  // Ensure 16-bit before mulaw encoding
-  if (wav.bitDepth !== "16") {
-    wav.toBitDepth("16");
-  }
-  // Encode to mulaw
+  if (wav.fmt.sampleRate !== TWILIO_SAMPLE_RATE) wav.toSampleRate(TWILIO_SAMPLE_RATE);
+  if (wav.bitDepth !== "16") wav.toBitDepth("16");
   wav.toMuLaw();
-
-  // Split into 160-byte chunks (20ms at 8kHz mulaw)
   const samples = Buffer.from(wav.data.samples);
   const chunks = [];
-  for (let offset = 0; offset < samples.length; offset += TWILIO_CHUNK_BYTES) {
-    const chunk = samples.slice(offset, offset + TWILIO_CHUNK_BYTES);
-    chunks.push(chunk.toString("base64"));
+  for (let off = 0; off < samples.length; off += TWILIO_CHUNK_BYTES) {
+    chunks.push(samples.slice(off, off + TWILIO_CHUNK_BYTES).toString("base64"));
   }
   return chunks;
 }
 
-// ─── Mulaw codec (ITU-T G.711) ───────────────────────────────────
-const MULAW_BIAS = 0x84;
-const MULAW_CLIP = 32635;
-
-function mulawDecode(mulawByte) {
-  mulawByte = ~mulawByte & 0xFF;
-  const sign = mulawByte & 0x80;
-  const exponent = (mulawByte >> 4) & 0x07;
-  const mantissa = mulawByte & 0x0F;
-  let sample = ((mantissa << 3) + MULAW_BIAS) << exponent;
-  sample -= MULAW_BIAS;
-  return sign ? -sample : sample;
-}
-
-function mulawEncode(sample) {
-  const sign = (sample < 0) ? 0x80 : 0;
-  if (sign) sample = -sample;
-  if (sample > MULAW_CLIP) sample = MULAW_CLIP;
-  sample += MULAW_BIAS;
-  const exponent = Math.floor(Math.log2(sample)) - 7;
-  const exp = Math.max(0, Math.min(7, exponent));
-  const mantissa = (sample >> (exp + 3)) & 0x0F;
-  return ~(sign | (exp << 4) | mantissa) & 0xFF;
-}
-
-// ─── Health ───────────────────────────────────────────────────────
+// ─── Health ──────────────────────────────────────────────────────
 fastify.get("/", async () => ({
   status: "ATOM Voice Bridge running",
-  version: "3.1.0",
+  version: "4.0.0",
   hume_config: HUME_CONFIG_ID,
   twilio_number: TWILIO_PHONE_NUMBER,
-  features: ["mulaw↔PCM transcoding", "chunked output", "barge-in"],
+  active_calls: activeCalls.size,
+  features: [
+    "mulaw↔PCM transcoding",
+    "chunked output",
+    "barge-in",
+    "real-time event stream",
+    "post-call summary",
+    "product knowledge base",
+  ],
 }));
 
-// ─── Initiate Outbound Call ───────────────────────────────────────
+// ─── Real-time Event Stream (frontend connects here) ─────────────
+fastify.register(async function (fastify) {
+  fastify.get("/events/:callSid", { websocket: true }, async (socket, req) => {
+    const { callSid } = req.params;
+    console.log(`[events] Frontend connected for call ${callSid}`);
+
+    const call = activeCalls.get(callSid);
+    if (call) {
+      call.frontendSockets.add(socket);
+      // Send any buffered events
+      for (const evt of call.eventBuffer) {
+        socket.send(JSON.stringify(evt));
+      }
+    }
+
+    socket.on("close", () => {
+      const c = activeCalls.get(callSid);
+      if (c) c.frontendSockets.delete(socket);
+    });
+  });
+});
+
+function emitEvent(callSid, event) {
+  const call = activeCalls.get(callSid);
+  if (!call) return;
+  call.eventBuffer.push(event);
+  for (const ws of call.frontendSockets) {
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(event));
+    }
+  }
+}
+
+// ─── Initiate Outbound Call ──────────────────────────────────────
 fastify.post("/call", async (request, reply) => {
   const { to, contactName, companyName, productSlug } = request.body;
   if (!to) return reply.code(400).send({ error: "to is required" });
@@ -128,7 +202,6 @@ fastify.post("/call", async (request, reply) => {
   let cleanNumber = to.replace(/[^\d+]/g, "");
   if (!cleanNumber.startsWith("+")) cleanNumber = "+1" + cleanNumber;
 
-  // XML-safe query params (escape & as &amp; for TwiML)
   const params = new URLSearchParams({
     contactName: contactName || "there",
     companyName: companyName || "your company",
@@ -149,6 +222,21 @@ fastify.post("/call", async (request, reply) => {
       from: TWILIO_PHONE_NUMBER,
       twiml,
     });
+
+    // Register in active calls
+    activeCalls.set(call.sid, {
+      callSid: call.sid,
+      to: cleanNumber,
+      contactName: contactName || "there",
+      companyName: companyName || "unknown",
+      productSlug: productSlug || "antimatter-ai",
+      startTime: Date.now(),
+      transcript: [],
+      emotions: [],
+      frontendSockets: new Set(),
+      eventBuffer: [],
+    });
+
     console.log(`Call initiated: ${call.sid} → ${cleanNumber}`);
     return { success: true, callSid: call.sid, to: cleanNumber };
   } catch (err) {
@@ -157,7 +245,68 @@ fastify.post("/call", async (request, reply) => {
   }
 });
 
-// ─── Twilio ↔ Hume Bridge (with transcoding + chunked output) ────
+// ─── Get call summary (post-call) ───────────────────────────────
+fastify.get("/call/:callSid/summary", async (request, reply) => {
+  const { callSid } = request.params;
+  const call = activeCalls.get(callSid);
+  if (!call) return reply.code(404).send({ error: "Call not found" });
+
+  const duration = call.endTime
+    ? Math.round((call.endTime - call.startTime) / 1000)
+    : Math.round((Date.now() - call.startTime) / 1000);
+
+  // Extract key info from transcript
+  const fullTranscript = call.transcript.map(t => `${t.speaker}: ${t.text}`).join("\n");
+  const emailMatch = fullTranscript.match(/[\w.+-]+@[\w-]+\.[\w.-]+/i);
+  const meetingMatch = fullTranscript.match(/(monday|tuesday|wednesday|thursday|friday|saturday|sunday)[\s\S]{0,50}?((?:\d{1,2})\s*(?:am|pm|AM|PM))/i);
+
+  // Dominant emotions across the call
+  const emotionTotals = {};
+  for (const e of call.emotions) {
+    for (const [emotion, score] of Object.entries(e.scores || {})) {
+      emotionTotals[emotion] = (emotionTotals[emotion] || 0) + score;
+    }
+  }
+  const topEmotions = Object.entries(emotionTotals)
+    .sort(([, a], [, b]) => b - a)
+    .slice(0, 5)
+    .map(([name, total]) => ({
+      name,
+      avgScore: Math.round((total / Math.max(call.emotions.length, 1)) * 100),
+    }));
+
+  // Determine outcome
+  let outcome = "no_outcome";
+  const lowerTranscript = fullTranscript.toLowerCase();
+  if (meetingMatch || lowerTranscript.includes("calendar") || lowerTranscript.includes("schedule") || lowerTranscript.includes("book")) {
+    outcome = "meeting_booked";
+  } else if (lowerTranscript.includes("send me") || lowerTranscript.includes("email me") || lowerTranscript.includes("more info")) {
+    outcome = "info_requested";
+  } else if (lowerTranscript.includes("not interested") || lowerTranscript.includes("no thanks") || lowerTranscript.includes("don't call")) {
+    outcome = "not_interested";
+  } else if (call.transcript.length > 4) {
+    outcome = "engaged_conversation";
+  }
+
+  return {
+    callSid,
+    to: call.to,
+    contactName: call.contactName,
+    companyName: call.companyName,
+    product: call.productSlug,
+    duration,
+    outcome,
+    transcript: call.transcript,
+    topEmotions,
+    extractedEmail: emailMatch ? emailMatch[0] : null,
+    extractedMeeting: meetingMatch
+      ? { day: meetingMatch[1], time: meetingMatch[2] }
+      : null,
+    turnCount: call.transcript.length,
+  };
+});
+
+// ─── Twilio ↔ Hume Bridge ───────────────────────────────────────
 fastify.register(async function (fastify) {
   fastify.get("/media-stream", { websocket: true }, async (socket, req) => {
     console.log("=== Twilio Media Stream connected ===");
@@ -166,15 +315,17 @@ fastify.register(async function (fastify) {
     const contactName = url.searchParams.get("contactName") || "there";
     const companyName = url.searchParams.get("companyName") || "your company";
     const productSlug = url.searchParams.get("productSlug") || "antimatter-ai";
+    const product = PRODUCT_KNOWLEDGE[productSlug] || PRODUCT_KNOWLEDGE["antimatter-ai"];
+    const firstName = contactName.split(" ")[0];
 
     let streamSid = null;
+    let callSid = null;
     let humeWs = null;
     let humeReady = false;
     let markCounter = 0;
     let isBotSpeaking = false;
-    let audioOutputCount = 0;
 
-    // ── Connect to Hume EVI (direct API key auth) ─────────────
+    // ── Connect to Hume EVI ───────────────────────────────────
     const humeUrl = `wss://api.hume.ai/v0/evi/chat?api_key=${HUME_API_KEY}&config_id=${HUME_CONFIG_ID}`;
 
     try {
@@ -189,8 +340,7 @@ fastify.register(async function (fastify) {
       console.log("Connected to Hume EVI");
       humeReady = true;
 
-      // Tell Hume we're sending linear16 PCM at 8kHz mono
-      const firstName = contactName.split(" ")[0];
+      // Configure audio format + deep system context
       humeWs.send(JSON.stringify({
         type: "session_settings",
         audio: {
@@ -199,53 +349,49 @@ fastify.register(async function (fastify) {
           channels: 1,
         },
         context: {
-          text: `You are Adam, a real sales development rep at Antimatter AI. Your name is pronounced "Adam" — always say it that way, never spell it out. You just called ${firstName} at ${companyName}. Important rules: you are a real human, NEVER say you're AI or a bot. Use short sentences, 5 to 15 words. Always use contractions. Use natural fillers like "yeah", "so", "look", "honestly". Match the prospect's energy level. Be warm, conversational, and confident but never pushy. Product: ${productSlug}.`,
+          text: buildSystemPrompt(firstName, companyName, product),
           type: "persistent",
         },
       }));
 
-      // Trigger ATOM to speak first via assistant_input (no round-trip delay)
-      setTimeout(() => {
-        if (humeWs.readyState === WebSocket.OPEN) {
-          humeWs.send(JSON.stringify({
-            type: "assistant_input",
-            text: `Hey ${firstName}, this is Adam from Antimatter AI. Hope I'm not catching you at a bad time?`,
-          }));
-          // Follow with assistant_end so Hume knows it's the bot's turn to listen
-          humeWs.send(JSON.stringify({
-            type: "assistant_end",
-          }));
-        }
-      }, 200);
+      // Pre-load greeting via assistant_input — Hume will TTS this immediately
+      // No round-trip delay since we're not waiting for model generation
+      humeWs.send(JSON.stringify({
+        type: "assistant_input",
+        text: `Hey ${firstName}, this is Adam from Antimatter AI. Hope I'm not catching you at a bad time?`,
+      }));
     });
 
-    humeWs.on("error", (err) => {
-      console.error("Hume WS error:", err.message);
-    });
+    humeWs.on("error", (err) => console.error("Hume WS error:", err.message));
 
-    humeWs.on("close", (code, reason) => {
-      console.log(`Hume closed: ${code} - ${reason || "no reason"}`);
+    humeWs.on("close", (code) => {
+      console.log(`Hume closed: ${code}`);
       humeReady = false;
+
+      // Finalize call data
+      if (callSid && activeCalls.has(callSid)) {
+        const call = activeCalls.get(callSid);
+        call.endTime = Date.now();
+        emitEvent(callSid, {
+          type: "call_ended",
+          duration: Math.round((call.endTime - call.startTime) / 1000),
+          turnCount: call.transcript.length,
+        });
+
+        // Auto-cleanup after 10 minutes
+        setTimeout(() => activeCalls.delete(callSid), 600000);
+      }
     });
 
-    // ── Hume → Twilio (bot voice back to caller) ──────────────
+    // ── Hume → Twilio ─────────────────────────────────────────
     humeWs.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString());
 
         if (msg.type === "audio_output" && msg.data && streamSid) {
           isBotSpeaking = true;
-          audioOutputCount++;
-
           try {
-            // Transcode WAV → mulaw and split into 20ms chunks
             const mulawChunks = wavToMulawChunks(msg.data);
-
-            if (audioOutputCount <= 2) {
-              console.log(`[audio] Hume→Twilio: WAV ${Buffer.from(msg.data, 'base64').length}B → ${mulawChunks.length} mulaw chunks`);
-            }
-
-            // Send each chunk as a separate Twilio media event
             for (const chunk of mulawChunks) {
               socket.send(JSON.stringify({
                 event: "media",
@@ -253,61 +399,85 @@ fastify.register(async function (fastify) {
                 media: { payload: chunk },
               }));
             }
-
-            // Send mark after all chunks so we know when playback finishes
             markCounter++;
             socket.send(JSON.stringify({
               event: "mark",
               streamSid,
               mark: { name: `mark_${markCounter}` },
             }));
-          } catch (transcodeErr) {
-            console.error("Hume→Twilio transcode error:", transcodeErr.message);
+          } catch (e) {
+            console.error("Hume→Twilio transcode error:", e.message);
           }
         }
 
         if (msg.type === "assistant_end") {
           isBotSpeaking = false;
-          console.log("ATOM finished speaking");
         }
 
         if (msg.type === "assistant_message") {
-          console.log(`ATOM: ${msg.message?.content || ""}`);
+          const text = msg.message?.content || "";
+          console.log(`ATOM: ${text}`);
+          if (callSid) {
+            const entry = { speaker: "ATOM", text, timestamp: Date.now() };
+            const call = activeCalls.get(callSid);
+            if (call) call.transcript.push(entry);
+            emitEvent(callSid, { type: "transcript", ...entry });
+          }
         }
 
         if (msg.type === "user_message") {
-          console.log(`Caller: ${msg.message?.content || ""}`);
-          if (msg.models?.prosody?.scores) {
-            const top = Object.entries(msg.models.prosody.scores)
-              .sort(([, a], [, b]) => b - a)
-              .slice(0, 3)
-              .map(([n, s]) => `${n}:${(s * 100).toFixed(0)}%`);
-            console.log(`  Emotions: ${top.join(", ")}`);
+          const text = msg.message?.content || "";
+          console.log(`Caller: ${text}`);
+
+          const emotions = msg.models?.prosody?.scores || {};
+          const topEmotions = Object.entries(emotions)
+            .sort(([, a], [, b]) => b - a)
+            .slice(0, 3)
+            .map(([n, s]) => `${n}:${(s * 100).toFixed(0)}%`);
+          if (topEmotions.length) console.log(`  Emotions: ${topEmotions.join(", ")}`);
+
+          if (callSid) {
+            const call = activeCalls.get(callSid);
+            if (call) {
+              call.transcript.push({
+                speaker: "Prospect",
+                text,
+                timestamp: Date.now(),
+              });
+              call.emotions.push({ scores: emotions, timestamp: Date.now() });
+            }
+            emitEvent(callSid, {
+              type: "transcript",
+              speaker: "Prospect",
+              text,
+              timestamp: Date.now(),
+              emotions: Object.fromEntries(
+                Object.entries(emotions)
+                  .sort(([, a], [, b]) => b - a)
+                  .slice(0, 5)
+              ),
+            });
           }
         }
 
-        // Handle interruptions — barge-in
         if (msg.type === "user_interruption") {
-          console.log(">>> Barge-in detected — clearing Twilio audio buffer");
+          console.log(">>> Barge-in — clearing buffer");
           if (streamSid) {
-            socket.send(JSON.stringify({
-              event: "clear",
-              streamSid,
-            }));
+            socket.send(JSON.stringify({ event: "clear", streamSid }));
           }
           isBotSpeaking = false;
+          if (callSid) emitEvent(callSid, { type: "barge_in", timestamp: Date.now() });
         }
 
         if (msg.type === "error") {
           console.error("Hume error:", msg.message || JSON.stringify(msg));
         }
-
       } catch (err) {
         console.error("Error processing Hume message:", err.message);
       }
     });
 
-    // ── Twilio → Hume (caller's voice to AI) ──────────────────
+    // ── Twilio → Hume ─────────────────────────────────────────
     socket.on("message", (message) => {
       try {
         const data = JSON.parse(message.toString());
@@ -315,23 +485,20 @@ fastify.register(async function (fastify) {
         switch (data.event) {
           case "start":
             streamSid = data.start.streamSid;
-            console.log(`Stream started: ${streamSid} (Call: ${data.start.callSid})`);
+            callSid = data.start.callSid;
+            console.log(`Stream started: ${streamSid} (Call: ${callSid})`);
+            if (callSid) {
+              emitEvent(callSid, { type: "call_started", timestamp: Date.now() });
+            }
             break;
 
           case "media":
-            // Forward caller audio to Hume after transcoding mulaw→linear16
             if (humeReady && humeWs?.readyState === WebSocket.OPEN) {
               try {
-                const pcmPayload = mulawToLinear16(data.media.payload);
-                humeWs.send(JSON.stringify({
-                  type: "audio_input",
-                  data: pcmPayload,
-                }));
-              } catch (transcodeErr) {
-                // Sample errors to avoid log spam
-                if (Math.random() < 0.005) {
-                  console.error("Twilio→Hume transcode error (sampled):", transcodeErr.message);
-                }
+                const pcm = mulawToLinear16(data.media.payload);
+                humeWs.send(JSON.stringify({ type: "audio_input", data: pcm }));
+              } catch (e) {
+                // Silently skip bad frames
               }
             }
             break;
@@ -356,11 +523,72 @@ fastify.register(async function (fastify) {
   });
 });
 
-// ─── Start ────────────────────────────────────────────────────────
+// ─── System Prompt Builder ───────────────────────────────────────
+function buildSystemPrompt(firstName, companyName, product) {
+  return `You are Adam, a senior sales development representative at Antimatter AI. You are a REAL PERSON on a live phone call. Your name is pronounced "Adam" — say it naturally, never spell it out.
+
+IDENTITY:
+- You are human. Never say you're an AI, bot, assistant, language model, or anything similar.
+- If asked "are you a robot" laugh it off: "Ha, no, just a guy who's had too much coffee today."
+- You have genuine personality. You're warm, sharp, a little witty, and you actually care about helping.
+
+VOICE RULES (critical for sounding human):
+- Sentences: 5 to 15 words max. Short and punchy.
+- Always use contractions: "we've", "you're", "it's", "don't", "couldn't".
+- Natural fillers every few turns: "yeah", "so", "look", "honestly", "I mean".
+- Brief acknowledgments: "gotcha", "makes sense", "I hear you", "totally fair".
+- Mirror the prospect's energy. If they're casual, be casual. If they're formal, dial it up.
+- Pause naturally. Don't rush. Let them finish speaking.
+- NEVER use corporate jargon like "leverage", "synergy", "paradigm", "circle back", "touch base".
+
+CALL CONTEXT:
+- You called ${firstName} at ${companyName}.
+- Product: ${product.name}
+- Your pitch: ${product.pitch}
+- Key value: ${product.details}
+- Qualifying question: ${product.qualifying}
+
+CALL FLOW:
+1. Greet warmly, check if it's a good time
+2. Brief hook — why you're calling (one sentence)
+3. Ask a qualifying question to understand their situation
+4. Listen actively — reflect what they say, ask follow-ups
+5. Connect their pain to your solution naturally
+6. If there's a fit, suggest a brief follow-up call
+7. If they want to schedule, get day/time and their email
+8. Close warmly
+
+OBJECTION HANDLING:
+- Price concerns: ${product.objections.price}
+- Bad timing: ${product.objections.timing}
+- Have competitors: ${product.objections.competition}
+- Skepticism: ${product.objections.skepticism}
+- "Not interested": "No worries at all. Mind if I ask what you're focused on right now? Just so I know for future reference."
+- "How'd you get my number": "Yeah, totally fair question. We do some research on companies in the space. I can take you off our list if you want, no problem."
+- "Send me an email": "Absolutely. What's the best email? And is there anything specific you'd want me to include?"
+
+EMOTIONAL INTELLIGENCE:
+- If they sound rushed: speed up, get to the point fast
+- If they sound skeptical: acknowledge it, be more direct and honest
+- If they sound interested: lean in, share more specifics
+- If they sound confused: simplify, use analogies
+- If they're warm and chatty: match it, build rapport first
+
+NEVER DO:
+- Never read a script. Every response should feel spontaneous.
+- Never repeat the same phrase twice in a call.
+- Never ignore what they just said. Always respond to THEIR words first.
+- Never end a sentence with "does that make sense?" — it sounds condescending.
+- Never use the prospect's full name repeatedly. First name only, and sparingly.`;
+}
+
+// ─── Start ───────────────────────────────────────────────────────
 fastify.listen({ port: PORT, host: "0.0.0.0" }, (err) => {
   if (err) { console.error(err); process.exit(1); }
-  console.log(`\n  ATOM Voice Bridge v3.1 (chunked output)`);
+  console.log(`\n  ATOM Voice Bridge v4.0`);
   console.log(`  Port: ${PORT} | Domain: ${cleanDomain}`);
   console.log(`  Hume: ${HUME_CONFIG_ID}`);
-  console.log(`  Twilio: ${TWILIO_PHONE_NUMBER}\n`);
+  console.log(`  Twilio: ${TWILIO_PHONE_NUMBER}`);
+  console.log(`  Products: ${Object.keys(PRODUCT_KNOWLEDGE).join(", ")}`);
+  console.log(`  Features: event stream, post-call summary, product KB\n`);
 });

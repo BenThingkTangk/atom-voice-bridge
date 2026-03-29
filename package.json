@@ -1,6 +1,6 @@
 {
   "name": "atom-voice-bridge",
-  "version": "3.0.0",
+  "version": "4.0.0",
   "type": "module",
   "description": "ATOM Voice Bridge: Twilio ↔ Hume EVI real-time voice AI with mulaw↔PCM transcoding",
   "main": "server.js",
@@ -9,6 +9,7 @@
     "dev": "node --watch server.js"
   },
   "dependencies": {
+    "@fastify/cors": "^10.0.2",
     "@fastify/formbody": "^8.0.2",
     "@fastify/websocket": "^11.0.2",
     "dotenv": "^16.4.7",
