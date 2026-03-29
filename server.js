@@ -165,7 +165,7 @@ fastify.register(async function (fastify) {
       humeWs.send(JSON.stringify({
         type: "session_settings",
         audio: {
-          format: "linear16",
+          encoding: "linear16",
           sample_rate: HUME_SAMPLE_RATE,
           channels: 1,
         },
