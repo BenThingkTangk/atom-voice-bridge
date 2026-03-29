@@ -4,7 +4,8 @@ import fastifyFormBody from "@fastify/formbody";
 import WebSocket from "ws";
 import twilio from "twilio";
 import dotenv from "dotenv";
-import { fetchAccessToken } from "hume";
+import pkg from "wavefile";
+const { WaveFile } = pkg;
 
 dotenv.config();
 
@@ -21,9 +22,13 @@ const {
 const PORT = process.env.PORT || 6060;
 const cleanDomain = (DOMAIN || "localhost").replace(/(^\w+:|^)\/\//, "").replace(/\/+$/, "");
 
-// Validate env
+// Hume EVI accepts linear16 PCM — we'll send at 24kHz mono
+const HUME_SAMPLE_RATE = 24000;
+// Twilio media streams are always mulaw 8kHz mono
+const TWILIO_SAMPLE_RATE = 8000;
+
 if (!TWILIO_ACCOUNT_SID || !TWILIO_API_KEY_SID || !TWILIO_API_KEY_SECRET || !HUME_API_KEY) {
-  console.error("Missing required environment variables. Check .env file.");
+  console.error("Missing required environment variables.");
   process.exit(1);
 }
 
@@ -35,36 +40,77 @@ const fastify = Fastify({ logger: true });
 await fastify.register(fastifyFormBody);
 await fastify.register(fastifyWs);
 
-// ─── Health Check ─────────────────────────────────────────────────
+// ─── Audio Transcoding Helpers ────────────────────────────────────
+
+/**
+ * Convert Twilio mulaw 8kHz base64 → linear16 PCM 24kHz base64
+ * Twilio sends: 8-bit mulaw, 8kHz, mono
+ * Hume wants: 16-bit linear PCM, 24kHz, mono
+ */
+function mulawToLinear16(base64Mulaw) {
+  const wav = new WaveFile();
+  // Create a WAV from the raw mulaw samples
+  wav.fromScratch(1, TWILIO_SAMPLE_RATE, "8m", Buffer.from(base64Mulaw, "base64"));
+  // Decode mulaw → 16-bit linear PCM
+  wav.fromMuLaw();
+  // Upsample 8kHz → 24kHz
+  wav.toSampleRate(HUME_SAMPLE_RATE);
+  // Extract raw PCM samples (no WAV header) as base64
+  const samples = wav.data.samples;
+  return Buffer.from(samples).toString("base64");
+}
+
+/**
+ * Convert Hume audio_output (base64 WAV) → mulaw 8kHz base64
+ * Hume sends: base64-encoded WAV file (typically 24kHz linear16)
+ * Twilio expects: 8-bit mulaw, 8kHz, mono, base64 encoded
+ */
+function wavToMulaw(base64Wav) {
+  const wav = new WaveFile();
+  wav.fromBuffer(Buffer.from(base64Wav, "base64"));
+  // Downsample to 8kHz if needed
+  if (wav.fmt.sampleRate !== TWILIO_SAMPLE_RATE) {
+    wav.toSampleRate(TWILIO_SAMPLE_RATE);
+  }
+  // Ensure 16-bit before mulaw encoding
+  if (wav.bitDepth !== "16") {
+    wav.toBitDepth("16");
+  }
+  // Encode to mulaw
+  wav.toMuLaw();
+  // Return raw mulaw samples as base64
+  return Buffer.from(wav.data.samples).toString("base64");
+}
+
+// ─── Health ───────────────────────────────────────────────────────
 fastify.get("/", async () => ({
   status: "ATOM Voice Bridge running",
-  version: "1.0.0",
+  version: "3.0.0",
   hume_config: HUME_CONFIG_ID,
   twilio_number: TWILIO_PHONE_NUMBER,
+  features: ["mulaw↔PCM transcoding", "barge-in", "session_settings"],
 }));
 
 // ─── Initiate Outbound Call ───────────────────────────────────────
-// POST /call { to: "+16039302131", contactName: "Ben", companyName: "Nirmata", productSlug: "atom-enterprise" }
 fastify.post("/call", async (request, reply) => {
   const { to, contactName, companyName, productSlug } = request.body;
-
-  if (!to) return reply.code(400).send({ error: "Phone number (to) is required" });
+  if (!to) return reply.code(400).send({ error: "to is required" });
 
   let cleanNumber = to.replace(/[^\d+]/g, "");
   if (!cleanNumber.startsWith("+")) cleanNumber = "+1" + cleanNumber;
 
-  // TwiML: Connect the call to our WebSocket media stream
-  // Pass context as query params so the WebSocket handler knows who we're calling
+  // XML-safe query params (escape & as &amp; for TwiML)
   const params = new URLSearchParams({
     contactName: contactName || "there",
     companyName: companyName || "your company",
     productSlug: productSlug || "antimatter-ai",
   });
+  const safeParams = params.toString().replace(/&/g, "&amp;");
 
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <Stream url="wss://${cleanDomain}/media-stream?${params.toString()}" />
+    <Stream url="wss://${cleanDomain}/media-stream?${safeParams}" />
   </Connect>
 </Response>`;
 
@@ -74,7 +120,6 @@ fastify.post("/call", async (request, reply) => {
       from: TWILIO_PHONE_NUMBER,
       twiml,
     });
-
     console.log(`Call initiated: ${call.sid} → ${cleanNumber}`);
     return { success: true, callSid: call.sid, to: cleanNumber };
   } catch (err) {
@@ -83,12 +128,11 @@ fastify.post("/call", async (request, reply) => {
   }
 });
 
-// ─── Twilio Media Stream ↔ Hume EVI WebSocket Bridge ─────────────
+// ─── Twilio ↔ Hume Bridge (with transcoding) ─────────────────────
 fastify.register(async function (fastify) {
   fastify.get("/media-stream", { websocket: true }, async (socket, req) => {
-    console.log("Twilio Media Stream connected");
+    console.log("=== Twilio Media Stream connected ===");
 
-    // Parse context from query params
     const url = new URL(req.url, `http://${req.headers.host}`);
     const contactName = url.searchParams.get("contactName") || "there";
     const companyName = url.searchParams.get("companyName") || "your company";
@@ -97,129 +141,122 @@ fastify.register(async function (fastify) {
     let streamSid = null;
     let humeWs = null;
     let humeReady = false;
+    let markCounter = 0;
+    let isBotSpeaking = false;
+    let audioChunkBuffer = []; // Buffer small Twilio chunks before sending to Hume
 
-    // Get Hume access token
-    let accessToken;
+    // ── Connect to Hume EVI (direct API key auth) ─────────────
+    const humeUrl = `wss://api.hume.ai/v0/evi/chat?api_key=${HUME_API_KEY}&config_id=${HUME_CONFIG_ID}`;
+
     try {
-      accessToken = await fetchAccessToken({ apiKey: HUME_API_KEY });
-      if (!accessToken) throw new Error("No token returned");
+      humeWs = new WebSocket(humeUrl);
     } catch (err) {
-      console.error("Failed to get Hume access token:", err.message);
+      console.error("Failed to create Hume WebSocket:", err.message);
       socket.close();
       return;
     }
 
-    // Build the system prompt for this specific call
-    const systemPrompt = `You are ATOM from Antimatter AI. You're on a live phone call with ${contactName} at ${companyName}.
-
-YOU ARE A REAL PERSON on a phone call. Never say you're AI.
-
-VOICE RULES:
-- Short sentences, 5-15 words max
-- Always use contractions: I'm, we've, you'll, that's
-- Natural fillers: "yeah so", "honestly", "look"
-- Backchannels: "gotcha", "I hear you", "that makes sense"
-- When they push back, pause, acknowledge genuinely, then redirect
-- Keep responses under 2 sentences
-- Ask one question at a time
-- Listen more than you talk
-
-WHAT YOU KNOW:
-- Antimatter AI: Full-service AI dev, product design, GTM. 20+ projects, 100% satisfaction.
-- ATOM Enterprise: Deploy AI agents VPC/on-prem/edge. Zero-training, full IP ownership.
-- Vidzee: Listing photos to cinematic videos in 5 min. Save $200-500/video.
-- Clinix Agent: AI billing/denial appeals. Success-based pricing.
-- Clinix AI: AI SOAP notes, ICD-10/CPT coding. Save 2-3 hours/day.
-- Red Team ATOM: Quantum-ready red team. PQC engine, MITRE ATLAS.
-
-Start by introducing yourself naturally. Say something like: "Hey ${contactName.split(" ")[0]}, it's ATOM from Antimatter AI. Hope I'm not catching you at a bad time?"`;
-
-    // Connect to Hume EVI WebSocket
-    const humeUrl = `wss://api.hume.ai/v0/evi/chat?access_token=${accessToken}&config_id=${HUME_CONFIG_ID}`;
-    humeWs = new WebSocket(humeUrl);
-
     humeWs.on("open", () => {
-      console.log("Connected to Hume EVI");
+      console.log("Connected to Hume EVI (direct API key auth)");
       humeReady = true;
 
-      // Send session settings with our system prompt
+      // CRITICAL: Tell Hume what audio format we're sending
+      // We transcode Twilio mulaw→linear16 PCM at 24kHz mono
       humeWs.send(JSON.stringify({
         type: "session_settings",
-        system_prompt: systemPrompt,
-        context: {
-          text: `You are calling ${contactName} at ${companyName} about ${productSlug}. Start the conversation by greeting them.`,
-          type: "persistent"
-        }
+        audio: {
+          format: "linear16",
+          sample_rate: HUME_SAMPLE_RATE,
+          channels: 1,
+        },
+        system_prompt: `You are ATOM, a real sales development rep from Antimatter AI. You're on a phone call with ${contactName} at ${companyName}. Rules: you are a real person, NEVER say you're AI or a bot or an assistant. Use short sentences, 5 to 15 words max. Always use contractions. Throw in natural fillers like "yeah" "so" "look" "honestly". Match the prospect's energy. Be warm, conversational, confident but not pushy. Pitch: ${productSlug}. Start by greeting them warmly.`,
       }));
 
-      // Tell ATOM to speak first (greet the prospect)
+      // Make ATOM speak first after a brief pause
+      const firstName = contactName.split(" ")[0];
       setTimeout(() => {
-        humeWs.send(JSON.stringify({
-          type: "assistant_input",
-          text: `Hey ${contactName.split(" ")[0]}, it's ATOM from Antimatter AI. Hope I'm not catching you at a bad time?`
-        }));
+        if (humeWs.readyState === WebSocket.OPEN) {
+          humeWs.send(JSON.stringify({
+            type: "assistant_input",
+            text: `Hey ${firstName}, it's ATOM from Antimatter AI. Hope I'm not catching you at a bad time?`,
+          }));
+        }
       }, 500);
     });
 
     humeWs.on("error", (err) => {
-      console.error("Hume WebSocket error:", err.message);
+      console.error("Hume WS error:", err.message);
     });
 
     humeWs.on("close", (code, reason) => {
-      console.log(`Hume WebSocket closed: ${code} ${reason}`);
+      console.log(`Hume closed: ${code} - ${reason || "no reason"}`);
       humeReady = false;
     });
 
-    // ─── Hume → Twilio (AI voice response back to caller) ─────────
+    // ── Hume → Twilio (bot voice back to caller) ──────────────
     humeWs.on("message", (data) => {
       try {
         const msg = JSON.parse(data.toString());
 
-        // Hume sends audio chunks as base64-encoded audio
-        if (msg.type === "audio_output") {
-          // Hume outputs PCM audio; Twilio expects mulaw
-          // Hume EVI's audio output is already base64 encoded
-          if (streamSid && msg.data) {
-            const audioMessage = {
+        if (msg.type === "audio_output" && msg.data && streamSid) {
+          isBotSpeaking = true;
+
+          try {
+            // Transcode: Hume WAV → mulaw 8kHz for Twilio
+            const mulawPayload = wavToMulaw(msg.data);
+
+            socket.send(JSON.stringify({
               event: "media",
-              streamSid: streamSid,
-              media: {
-                payload: msg.data, // base64 audio from Hume
-              },
-            };
-            socket.send(JSON.stringify(audioMessage));
+              streamSid,
+              media: { payload: mulawPayload },
+            }));
+
+            // Send mark so we know when playback completes
+            markCounter++;
+            socket.send(JSON.stringify({
+              event: "mark",
+              streamSid,
+              mark: { name: `mark_${markCounter}` },
+            }));
+          } catch (transcodeErr) {
+            console.error("Hume→Twilio transcode error:", transcodeErr.message);
           }
         }
 
-        // Log assistant messages for debugging
-        if (msg.type === "assistant_message") {
-          console.log(`ATOM: ${msg.message?.content || "(audio)"}`);
+        if (msg.type === "assistant_end") {
+          isBotSpeaking = false;
+          console.log("ATOM finished speaking");
         }
 
-        // Log user messages (what the caller said)
+        if (msg.type === "assistant_message") {
+          console.log(`ATOM: ${msg.message?.content || ""}`);
+        }
+
         if (msg.type === "user_message") {
-          console.log(`Caller: ${msg.message?.content || "(audio)"}`);
-          
-          // Log emotion scores if available
+          console.log(`Caller: ${msg.message?.content || ""}`);
           if (msg.models?.prosody?.scores) {
-            const topEmotions = Object.entries(msg.models.prosody.scores)
+            const top = Object.entries(msg.models.prosody.scores)
               .sort(([, a], [, b]) => b - a)
               .slice(0, 3)
-              .map(([name, score]) => `${name}: ${(score * 100).toFixed(0)}%`);
-            console.log(`  Emotions: ${topEmotions.join(", ")}`);
+              .map(([n, s]) => `${n}:${(s * 100).toFixed(0)}%`);
+            console.log(`  Emotions: ${top.join(", ")}`);
           }
         }
 
-        // Handle interruptions - Hume handles this natively with EVI
+        // Handle interruptions — Hume detects user speaking over bot
         if (msg.type === "user_interruption") {
-          console.log("User interrupted ATOM - Hume handling barge-in");
-          // Clear any pending audio to Twilio
+          console.log(">>> Barge-in detected — clearing Twilio audio buffer");
           if (streamSid) {
             socket.send(JSON.stringify({
               event: "clear",
-              streamSid: streamSid,
+              streamSid,
             }));
           }
+          isBotSpeaking = false;
+        }
+
+        if (msg.type === "error") {
+          console.error("Hume error:", msg.message || JSON.stringify(msg));
         }
 
       } catch (err) {
@@ -227,7 +264,7 @@ Start by introducing yourself naturally. Say something like: "Hey ${contactName.
       }
     });
 
-    // ─── Twilio → Hume (caller's voice to AI) ────────────────────
+    // ── Twilio → Hume (caller's voice to AI) ──────────────────
     socket.on("message", (message) => {
       try {
         const data = JSON.parse(message.toString());
@@ -235,73 +272,58 @@ Start by introducing yourself naturally. Say something like: "Hey ${contactName.
         switch (data.event) {
           case "start":
             streamSid = data.start.streamSid;
-            console.log(`Twilio stream started: ${streamSid}`);
-            console.log(`  Call SID: ${data.start.callSid}`);
-            console.log(`  Tracks: ${data.start.tracks}`);
+            console.log(`Stream started: ${streamSid} (Call: ${data.start.callSid})`);
+            console.log(`  Encoding: ${data.start.mediaFormat?.encoding || "mulaw"}`);
+            console.log(`  Sample rate: ${data.start.mediaFormat?.sampleRate || 8000}`);
             break;
 
           case "media":
-            // Forward caller's audio to Hume EVI
+            // Forward caller audio to Hume after transcoding
             if (humeReady && humeWs?.readyState === WebSocket.OPEN) {
-              // Twilio sends mulaw 8kHz audio as base64
-              // Hume EVI accepts audio input via the audio_input message type
-              humeWs.send(JSON.stringify({
-                type: "audio_input",
-                data: data.media.payload, // base64 mulaw audio from Twilio
-              }));
-            }
-            break;
+              try {
+                // Transcode: Twilio mulaw 8kHz → linear16 PCM 24kHz
+                const pcmPayload = mulawToLinear16(data.media.payload);
 
-          case "stop":
-            console.log("Twilio stream stopped");
-            if (humeWs?.readyState === WebSocket.OPEN) {
-              humeWs.close();
+                humeWs.send(JSON.stringify({
+                  type: "audio_input",
+                  data: pcmPayload,
+                }));
+              } catch (transcodeErr) {
+                // Don't spam logs for every chunk — only log periodically
+                if (Math.random() < 0.01) {
+                  console.error("Twilio→Hume transcode error (sampled):", transcodeErr.message);
+                }
+              }
             }
             break;
 
           case "mark":
-            // Audio playback marker from Twilio
+            // Twilio finished playing a chunk
             break;
 
-          default:
-            console.log(`Twilio event: ${data.event}`);
+          case "stop":
+            console.log("Twilio stream stopped");
+            if (humeWs?.readyState === WebSocket.OPEN) humeWs.close();
+            break;
         }
       } catch (err) {
         console.error("Error processing Twilio message:", err.message);
       }
     });
 
-    // ─── Cleanup ──────────────────────────────────────────────────
     socket.on("close", () => {
-      console.log("Twilio Media Stream disconnected");
-      if (humeWs?.readyState === WebSocket.OPEN) {
-        humeWs.close();
-      }
-    });
-
-    socket.on("error", (err) => {
-      console.error("Twilio WebSocket error:", err.message);
+      console.log("=== Twilio disconnected ===");
+      if (humeWs?.readyState === WebSocket.OPEN) humeWs.close();
     });
   });
 });
 
-// ─── Start Server ─────────────────────────────────────────────────
+// ─── Start ────────────────────────────────────────────────────────
 fastify.listen({ port: PORT, host: "0.0.0.0" }, (err) => {
-  if (err) {
-    console.error(err);
-    process.exit(1);
-  }
-  console.log(`
-╔══════════════════════════════════════════════════╗
-║  ATOM Voice Bridge Server                        ║
-║  Port: ${PORT}                                       ║
-║  Hume Config: ${HUME_CONFIG_ID}  ║
-║  Twilio: ${TWILIO_PHONE_NUMBER}                       ║
-║                                                  ║
-║  Endpoints:                                      ║
-║  GET  /              Health check                ║
-║  POST /call          Initiate outbound call      ║
-║  WS   /media-stream  Twilio ↔ Hume bridge       ║
-╚══════════════════════════════════════════════════╝
-  `);
+  if (err) { console.error(err); process.exit(1); }
+  console.log(`\n  ATOM Voice Bridge v3.0 (with transcoding)`);
+  console.log(`  Port: ${PORT} | Domain: ${cleanDomain}`);
+  console.log(`  Hume: ${HUME_CONFIG_ID} | Rate: ${HUME_SAMPLE_RATE}Hz`);
+  console.log(`  Twilio: ${TWILIO_PHONE_NUMBER} | Rate: ${TWILIO_SAMPLE_RATE}Hz`);
+  console.log(`  Transcoding: mulaw 8kHz ↔ linear16 PCM ${HUME_SAMPLE_RATE / 1000}kHz\n`);
 });
